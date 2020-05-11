@@ -235,14 +235,14 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
    * Update tailFiles mapping if a new file is created or appends are detected
    * to the existing file.
    */
-  public List<Long> updateTailFiles(boolean skipToEnd) throws IOException {
+  public List<Long> updateTailFiles(boolean skipToEnd,boolean isRecursive) throws IOException {
     updateTime = System.currentTimeMillis();
     List<Long> updatedInodes = Lists.newArrayList();
 
     for (TaildirMatcher taildir : taildirCache) {
       Map<String, String> headers = headerTable.row(taildir.getFileGroup());
 
-      for (File f : taildir.getMatchingFiles()) {
+      for (File f : taildir.getMatchingFiles(isRecursive)) {
         long inode;
         try {
           inode = getInode(f);
@@ -275,8 +275,8 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
     return updatedInodes;
   }
 
-  public List<Long> updateTailFiles() throws IOException {
-    return updateTailFiles(false);
+  public List<Long> updateTailFiles(boolean isRecursive) throws IOException {
+    return updateTailFiles(false,isRecursive);
   }
 
 

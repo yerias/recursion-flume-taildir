@@ -28,16 +28,9 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
-import java.nio.file.DirectoryStream;
-import java.nio.file.FileSystem;
-import java.nio.file.FileSystems;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.PathMatcher;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.List;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -66,221 +59,256 @@ import java.util.concurrent.TimeUnit;
 @InterfaceAudience.Private
 @InterfaceStability.Evolving
 public class TaildirMatcher {
-  private static final Logger logger = LoggerFactory.getLogger(TaildirMatcher.class);
-  private static final FileSystem FS = FileSystems.getDefault();
+    private static final Logger logger = LoggerFactory.getLogger(TaildirMatcher.class);
+    private static final FileSystem FS = FileSystems.getDefault();
 
-  // flag from configuration to switch off caching completely
-  private final boolean cachePatternMatching;
-  // id from configuration
-  private final String fileGroup;
-  // plain string of the desired files from configuration
-  private final String filePattern;
+    // flag from configuration to switch off caching completely
+    private final boolean cachePatternMatching;
+    // id from configuration
+    private final String fileGroup;
+    // plain string of the desired files from configuration
+    private final String filePattern;
 
-  // directory monitored for changes
-  private final File parentDir;
-  // cached instance for filtering files based on filePattern
-  private final DirectoryStream.Filter<Path> fileFilter;
+    // directory monitored for changes
+    private final File parentDir;
+    // cached instance for filtering files based on filePattern
+    private final DirectoryStream.Filter<Path> fileFilter;
 
-  // system time in milliseconds, stores the last modification time of the
-  // parent directory seen by the last check, rounded to seconds
-  // initial value is used in first check only when it will be replaced instantly
-  // (system time is positive)
-  private long lastSeenParentDirMTime = -1;
-  // system time in milliseconds, time of the last check, rounded to seconds
-  // initial value is used in first check only when it will be replaced instantly
-  // (system time is positive)
-  private long lastCheckedTime = -1;
-  // cached content, files which matched the pattern within the parent directory
-  private List<File> lastMatchedFiles = Lists.newArrayList();
+    // system time in milliseconds, stores the last modification time of the
+    // parent directory seen by the last check, rounded to seconds
+    // initial value is used in first check only when it will be replaced instantly
+    // (system time is positive)
+    private long lastSeenParentDirMTime = -1;
+    // system time in milliseconds, time of the last check, rounded to seconds
+    // initial value is used in first check only when it will be replaced instantly
+    // (system time is positive)
+    private long lastCheckedTime = -1;
+    // cached content, files which matched the pattern within the parent directory
+    private List<File> lastMatchedFiles = Lists.newArrayList();
 
-  /**
-   * Package accessible constructor. From configuration context it represents a single
-   * <code>filegroup</code> and encapsulates the corresponding <code>filePattern</code>.
-   * <code>filePattern</code> consists of two parts: first part has to be a valid path to an
-   * existing parent directory, second part has to be a valid regex
-   * {@link java.util.regex.Pattern} that match any non-hidden file names within parent directory
-   * . A valid example for filePattern is <code>/dir0/dir1/.*</code> given
-   * <code>/dir0/dir1</code> is an existing directory structure readable by the running user.
-   * <p></p>
-   * An instance of this class is created for each fileGroup
-   *
-   * @param fileGroup arbitrary name of the group given by the config
-   * @param filePattern parent directory plus regex pattern. No wildcards are allowed in directory
-   *                    name
-   * @param cachePatternMatching default true, recommended in every setup especially with huge
-   *                             parent directories. Don't set when local system clock is not used
-   *                             for stamping mtime (eg: remote filesystems)
-   * @see TaildirSourceConfigurationConstants
-   */
-  TaildirMatcher(String fileGroup, String filePattern, boolean cachePatternMatching) {
-    // store whatever came from configuration
-    this.fileGroup = fileGroup;
-    this.filePattern = filePattern;
-    this.cachePatternMatching = cachePatternMatching;
+    /**
+     * Package accessible constructor. From configuration context it represents a single
+     * <code>filegroup</code> and encapsulates the corresponding <code>filePattern</code>.
+     * <code>filePattern</code> consists of two parts: first part has to be a valid path to an
+     * existing parent directory, second part has to be a valid regex
+     * {@link java.util.regex.Pattern} that match any non-hidden file names within parent directory
+     * . A valid example for filePattern is <code>/dir0/dir1/.*</code> given
+     * <code>/dir0/dir1</code> is an existing directory structure readable by the running user.
+     * <p></p>
+     * An instance of this class is created for each fileGroup
+     *
+     * @param fileGroup            arbitrary name of the group given by the config
+     * @param filePattern          parent directory plus regex pattern. No wildcards are allowed in directory
+     *                             name
+     * @param cachePatternMatching default true, recommended in every setup especially with huge
+     *                             parent directories. Don't set when local system clock is not used
+     *                             for stamping mtime (eg: remote filesystems)
+     * @see TaildirSourceConfigurationConstants
+     */
+    TaildirMatcher(String fileGroup, String filePattern, boolean cachePatternMatching) {
+        // store whatever came from configuration
+        this.fileGroup = fileGroup;
+        this.filePattern = filePattern;
+        this.cachePatternMatching = cachePatternMatching;
 
-    // calculate final members
-    File f = new File(filePattern);
-    this.parentDir = f.getParentFile();
-    String regex = f.getName();
-    final PathMatcher matcher = FS.getPathMatcher("regex:" + regex);
-    this.fileFilter = new DirectoryStream.Filter<Path>() {
-      @Override
-      public boolean accept(Path entry) throws IOException {
-        return matcher.matches(entry.getFileName()) && !Files.isDirectory(entry);
-      }
-    };
+        // calculate final members
+        File f = new File(filePattern);
+        this.parentDir = f.getParentFile();
+        String regex = f.getName();
+        final PathMatcher matcher = FS.getPathMatcher("regex:" + regex);
+        this.fileFilter = new DirectoryStream.Filter<Path>() {
+            @Override
+            public boolean accept(Path entry) throws IOException {
+                return matcher.matches(entry.getFileName()) && !Files.isDirectory(entry);
+            }
+        };
 
-    // sanity check
-    Preconditions.checkState(parentDir.exists(),
-        "Directory does not exist: " + parentDir.getAbsolutePath());
-  }
-
-  /**
-   * Lists those files within the parentDir that match regex pattern passed in during object
-   * instantiation. Designed for frequent periodic invocation
-   * {@link org.apache.flume.source.PollableSourceRunner}.
-   * <p></p>
-   * Based on the modification of the parentDir this function may trigger cache recalculation by
-   * calling {@linkplain #getMatchingFilesNoCache()} or
-   * return the value stored in {@linkplain #lastMatchedFiles}.
-   * Parentdir is allowed to be a symbolic link.
-   * <p></p>
-   * Files returned by this call are weakly consistent (see {@link DirectoryStream}).
-   * It does not freeze the directory while iterating,
-   * so it may (or may not) reflect updates to the directory that occur during the call,
-   * In which case next call
-   * will return those files (as mtime is increasing it won't hit cache but trigger recalculation).
-   * It is guaranteed that invocation reflects every change which was observable at the time of
-   * invocation.
-   * <p></p>
-   * Matching file list recalculation is triggered when caching was turned off or
-   * if mtime is greater than the previously seen mtime
-   * (including the case of cache hasn't been calculated before).
-   * Additionally if a constantly updated directory was configured as parentDir
-   * then multiple changes to the parentDir may happen
-   * within the same second so in such case (assuming at least second granularity of reported mtime)
-   * it is impossible to tell whether a change of the dir happened before the check or after
-   * (unless the check happened after that second).
-   * Having said that implementation also stores system time of the previous invocation and previous
-   * invocation has to happen strictly after the current mtime to avoid further cache refresh
-   * (because then it is guaranteed that previous invocation resulted in valid cache content).
-   * If system clock hasn't passed the second of
-   * the current mtime then logic expects more changes as well
-   * (since it cannot be sure that there won't be any further changes still in that second
-   * and it would like to avoid data loss in first place)
-   * hence it recalculates matching files. If system clock finally
-   * passed actual mtime then a subsequent invocation guarantees that it picked up every
-   * change from the passed second so
-   * any further invocations can be served from cache associated with that second
-   * (given mtime is not updated again).
-   *
-   * @return List of files matching the pattern sorted by last modification time. No recursion.
-   * No directories. If nothing matches then returns an empty list. If I/O issue occurred then
-   * returns the list collected to the point when exception was thrown.
-   *
-   * @see #getMatchingFilesNoCache()
-   */
-  List<File> getMatchingFiles() {
-    long now = TimeUnit.SECONDS.toMillis(
-        TimeUnit.MILLISECONDS.toSeconds(System.currentTimeMillis()));
-    long currentParentDirMTime = parentDir.lastModified();
-    List<File> result;
-
-    // calculate matched files if
-    // - we don't want to use cache (recalculate every time) OR
-    // - directory was clearly updated after the last check OR
-    // - last mtime change wasn't already checked for sure
-    //   (system clock hasn't passed that second yet)
-    if (!cachePatternMatching ||
-        lastSeenParentDirMTime < currentParentDirMTime ||
-        !(currentParentDirMTime < lastCheckedTime)) {
-      lastMatchedFiles = sortByLastModifiedTime(getMatchingFilesNoCache());
-      lastSeenParentDirMTime = currentParentDirMTime;
-      lastCheckedTime = now;
+        // sanity check
+        Preconditions.checkState(parentDir.exists(),
+                "Directory does not exist: " + parentDir.getAbsolutePath());
     }
 
-    return lastMatchedFiles;
-  }
+    /**
+     * Lists those files within the parentDir that match regex pattern passed in during object
+     * instantiation. Designed for frequent periodic invocation
+     * {@link org.apache.flume.source.PollableSourceRunner}.
+     * <p></p>
+     * Based on the modification of the parentDir this function may trigger cache recalculation by
+     * calling {@linkplain #getMatchingFilesNoCache()} or
+     * return the value stored in {@linkplain #lastMatchedFiles}.
+     * Parentdir is allowed to be a symbolic link.
+     * <p></p>
+     * Files returned by this call are weakly consistent (see {@link DirectoryStream}).
+     * It does not freeze the directory while iterating,
+     * so it may (or may not) reflect updates to the directory that occur during the call,
+     * In which case next call
+     * will return those files (as mtime is increasing it won't hit cache but trigger recalculation).
+     * It is guaranteed that invocation reflects every change which was observable at the time of
+     * invocation.
+     * <p></p>
+     * Matching file list recalculation is triggered when caching was turned off or
+     * if mtime is greater than the previously seen mtime
+     * (including the case of cache hasn't been calculated before).
+     * Additionally if a constantly updated directory was configured as parentDir
+     * then multiple changes to the parentDir may happen
+     * within the same second so in such case (assuming at least second granularity of reported mtime)
+     * it is impossible to tell whether a change of the dir happened before the check or after
+     * (unless the check happened after that second).
+     * Having said that implementation also stores system time of the previous invocation and previous
+     * invocation has to happen strictly after the current mtime to avoid further cache refresh
+     * (because then it is guaranteed that previous invocation resulted in valid cache content).
+     * If system clock hasn't passed the second of
+     * the current mtime then logic expects more changes as well
+     * (since it cannot be sure that there won't be any further changes still in that second
+     * and it would like to avoid data loss in first place)
+     * hence it recalculates matching files. If system clock finally
+     * passed actual mtime then a subsequent invocation guarantees that it picked up every
+     * change from the passed second so
+     * any further invocations can be served from cache associated with that second
+     * (given mtime is not updated again).
+     *
+     * @return List of files matching the pattern sorted by last modification time. No recursion.
+     * No directories. If nothing matches then returns an empty list. If I/O issue occurred then
+     * returns the list collected to the point when exception was thrown.
+     * @see #getMatchingFilesNoCache()
+     */
+    List<File> getMatchingFiles(boolean isRecursive) {
+        long now = TimeUnit.SECONDS.toMillis(
+                TimeUnit.MILLISECONDS.toSeconds(System.currentTimeMillis()));
+        long currentParentDirMTime = parentDir.lastModified();
+        List<File> result;
 
-  /**
-   * Provides the actual files within the parentDir which
-   * files are matching the regex pattern. Each invocation uses {@link DirectoryStream}
-   * to identify matching files.
-   *
-   * Files returned by this call are weakly consistent (see {@link DirectoryStream}).
-   * It does not freeze the directory while iterating, so it may (or may not) reflect updates
-   * to the directory that occur during the call. In which case next call will return those files.
-   *
-   * @return List of files matching the pattern unsorted. No recursion. No directories.
-   * If nothing matches then returns an empty list. If I/O issue occurred then returns the list
-   * collected to the point when exception was thrown.
-   *
-   * @see DirectoryStream
-   * @see DirectoryStream.Filter
-   */
-  private List<File> getMatchingFilesNoCache() {
-    List<File> result = Lists.newArrayList();
-    try (DirectoryStream<Path> stream = Files.newDirectoryStream(parentDir.toPath(), fileFilter)) {
-      for (Path entry : stream) {
-        result.add(entry.toFile());
-      }
-    } catch (IOException e) {
-      logger.error("I/O exception occurred while listing parent directory. " +
-                   "Files already matched will be returned. " + parentDir.toPath(), e);
+        // calculate matched files if
+        // - we don't want to use cache (recalculate every time) OR
+        // - directory was clearly updated after the last check OR
+        // - last mtime change wasn't already checked for sure
+        //   (system clock hasn't passed that second yet)
+        if (!cachePatternMatching ||
+                lastSeenParentDirMTime < currentParentDirMTime ||
+                !(currentParentDirMTime < lastCheckedTime)) {
+            lastMatchedFiles = sortByLastModifiedTime(getMatchingFilesNoCache(isRecursive));
+            lastSeenParentDirMTime = currentParentDirMTime;
+            lastCheckedTime = now;
+        }
+
+        return lastMatchedFiles;
     }
-    return result;
-  }
 
-  /**
-   * Utility function to sort matched files based on last modification time.
-   * Sorting itself use only a snapshot of last modification times captured before the sorting
-   * to keep the number of stat system calls to the required minimum.
-   *
-   * @param files list of files in any order
-   * @return sorted list
-   */
-  private static List<File> sortByLastModifiedTime(List<File> files) {
-    final HashMap<File, Long> lastModificationTimes = new HashMap<File, Long>(files.size());
-    for (File f: files) {
-      lastModificationTimes.put(f, f.lastModified());
+    /**
+     * Provides the actual files within the parentDir which
+     * files are matching the regex pattern. Each invocation uses {@link DirectoryStream}
+     * to identify matching files.
+     * <p>
+     * Files returned by this call are weakly consistent (see {@link DirectoryStream}).
+     * It does not freeze the directory while iterating, so it may (or may not) reflect updates
+     * to the directory that occur during the call. In which case next call will return those files.
+     *
+     * @return List of files matching the pattern unsorted. No recursion. No directories.
+     * If nothing matches then returns an empty list. If I/O issue occurred then returns the list
+     * collected to the point when exception was thrown.
+     * @see DirectoryStream
+     * @see DirectoryStream.Filter
+     */
+    private List<File> getMatchingFilesNoCache() {
+        List<File> result = Lists.newArrayList();
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(parentDir.toPath(), fileFilter)) {
+            for (Path entry : stream) {
+                result.add(entry.toFile());
+            }
+        } catch (IOException e) {
+            logger.error("I/O exception occurred while listing parent directory. " +
+                    "Files already matched will be returned. " + parentDir.toPath(), e);
+        }
+        return result;
     }
-    Collections.sort(files, new Comparator<File>() {
-      @Override
-      public int compare(File o1, File o2) {
-        return lastModificationTimes.get(o1).compareTo(lastModificationTimes.get(o2));
-      }
-    });
 
-    return files;
-  }
+    private List<File> getMatchingFilesNoCache(boolean recursive) {
 
-  @Override
-  public String toString() {
-    return "{" +
-        "filegroup='" + fileGroup + '\'' +
-        ", filePattern='" + filePattern + '\'' +
-        ", cached=" + cachePatternMatching +
-        '}';
-  }
+        if (!recursive) {
+            return getMatchingFilesNoCache();
+        }
+        // result 存放所有文件
+        List<File> result = Lists.newArrayList();
+        // 使用非递归，即队列的方式遍历文件夹
+        Queue<File> dirs = new ArrayBlockingQueue<>(10);
+        // 添加父目录
+        dirs.offer(parentDir);
+        while (dirs.size() > 0) {
+            File dir = dirs.poll();
+            // 匹配出所有符合通配符的文件
+            try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir.toPath(), fileFilter)) {
+                // 将这些文件添加到result中去
+                for (Path entry : stream) {
+                    result.add(entry.toFile());
+                }
+            } catch (IOException e) {
+                logger.error("I/O exception occurred while listing parent directory. " +
+                        "Files already matched will be returned. " + parentDir.toPath(), e);
+            }
+            // 列出这个目录下的所有文件
+            File[] dirList = dir.listFiles();
+            assert dirList != null;
+            // 如果是目录，则添加到dirs中，进行下一次循环
+            for (File f : dirList) {
+                if (f.isDirectory()) {
+                    dirs.add(f);
+                }
+            }
+        }
+        return result;
+    }
 
-  @Override
-  public boolean equals(Object o) {
-    if (this == o) return true;
-    if (o == null || getClass() != o.getClass()) return false;
 
-    TaildirMatcher that = (TaildirMatcher) o;
+    /**
+     * Utility function to sort matched files based on last modification time.
+     * Sorting itself use only a snapshot of last modification times captured before the sorting
+     * to keep the number of stat system calls to the required minimum.
+     *
+     * @param files list of files in any order
+     * @return sorted list
+     */
+    private static List<File> sortByLastModifiedTime(List<File> files) {
+        final HashMap<File, Long> lastModificationTimes = new HashMap<File, Long>(files.size());
+        for (File f : files) {
+            lastModificationTimes.put(f, f.lastModified());
+        }
+        Collections.sort(files, new Comparator<File>() {
+            @Override
+            public int compare(File o1, File o2) {
+                return lastModificationTimes.get(o1).compareTo(lastModificationTimes.get(o2));
+            }
+        });
 
-    return fileGroup.equals(that.fileGroup);
+        return files;
+    }
 
-  }
+    @Override
+    public String toString() {
+        return "{" +
+                "filegroup='" + fileGroup + '\'' +
+                ", filePattern='" + filePattern + '\'' +
+                ", cached=" + cachePatternMatching +
+                '}';
+    }
 
-  @Override
-  public int hashCode() {
-    return fileGroup.hashCode();
-  }
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
 
-  public String getFileGroup() {
-    return fileGroup;
-  }
+        TaildirMatcher that = (TaildirMatcher) o;
+
+        return fileGroup.equals(that.fileGroup);
+
+    }
+
+    @Override
+    public int hashCode() {
+        return fileGroup.hashCode();
+    }
+
+    public String getFileGroup() {
+        return fileGroup;
+    }
 
 }

@@ -87,6 +87,10 @@ public class TaildirSource extends AbstractSource implements
   private boolean fileHeader;
   private String fileHeaderKey;
 
+  private static final String RECURSIVE = "recursive";
+  private static final boolean DEFAULT_RECURSIVE = false;
+  private boolean isRecursive;
+
   @Override
   public synchronized void start() {
     logger.info("{} TaildirSource source starting with directory: {}", getName(), filePaths);
@@ -185,6 +189,9 @@ public class TaildirSource extends AbstractSource implements
     fileHeaderKey = context.getString(FILENAME_HEADER_KEY,
             DEFAULT_FILENAME_HEADER_KEY);
 
+    isRecursive  = context.getBoolean(RECURSIVE, DEFAULT_RECURSIVE);
+
+
     if (sourceCounter == null) {
       sourceCounter = new SourceCounter(getName());
     }
@@ -219,7 +226,7 @@ public class TaildirSource extends AbstractSource implements
     Status status = Status.READY;
     try {
       existingInodes.clear();
-      existingInodes.addAll(reader.updateTailFiles());
+      existingInodes.addAll(reader.updateTailFiles(isRecursive));
       for (long inode : existingInodes) {
         TailFile tf = reader.getTailFiles().get(inode);
         if (tf.needTail()) {
